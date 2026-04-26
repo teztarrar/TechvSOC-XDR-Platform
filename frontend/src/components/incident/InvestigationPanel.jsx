@@ -67,14 +67,16 @@ function SeverityBadge({ severity }) {
 
 function StatusBadge({ status }) {
   const colors = {
-    open: "border-brand-400/30 text-brand-300 bg-brand-400/10",
+    new: "border-blue-400/30 text-blue-300 bg-blue-400/10",
     in_progress: "border-amber-400/30 text-amber-300 bg-amber-400/10",
+    investigating: "border-yellow-400/30 text-yellow-300 bg-yellow-400/10",
+    contained: "border-orange-400/30 text-orange-300 bg-orange-400/10",
     resolved: "border-emerald-400/30 text-emerald-300 bg-emerald-400/10",
     closed: "border-slate-400/30 text-slate-300 bg-slate-400/10",
   };
   return (
     <span
-      className={`rounded-full border px-3 py-1 text-xs uppercase tracking-wider ${colors[status] || colors.open}`}
+      className={`rounded-full border px-3 py-1 text-xs uppercase tracking-wider ${colors[status] || colors.new}`}
     >
       {status.replace("_", " ")}
     </span>
@@ -263,11 +265,11 @@ function InvestigationPanel({ incident, onClose, onIncidentUpdated }) {
                         </div>
                         <div className="rounded-xl border border-white/10 bg-white/5 p-4 text-center">
                           <p className="text-2xl font-semibold text-[var(--text-primary)]">
-                            {incident.status === "resolved"
-                              ? "Resolved"
-                              : incident.status === "in_progress"
-                                ? "Active"
-                                : "Open"}
+                            {incident.status === "resolved" || incident.status === "closed"
+                              ? incident.status.charAt(0).toUpperCase() + incident.status.slice(1)
+                              : incident.status === "new"
+                                ? "New"
+                                : "Active"}
                           </p>
                           <p className="mt-1 text-xs text-[var(--text-muted)]">Status</p>
                         </div>
