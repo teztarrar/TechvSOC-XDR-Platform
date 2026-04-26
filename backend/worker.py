@@ -11,6 +11,7 @@ import json
 import logging
 import sys
 import time
+from datetime import UTC
 from datetime import datetime
 
 from app.core.config import settings
@@ -34,7 +35,7 @@ logger = logging.getLogger("techvsoc.worker")
 def _parse_log_payload(payload: dict) -> LogEntry:
     data = json.loads(payload.get("payload", "{}"))
     event_timestamp_str = data.get("event_timestamp")
-    event_timestamp = datetime.fromisoformat(event_timestamp_str.replace("Z", "+00:00")) if event_timestamp_str else datetime.utcnow()
+    event_timestamp = datetime.fromisoformat(event_timestamp_str.replace("Z", "+00:00")) if event_timestamp_str else datetime.now(UTC)
 
     return LogEntry(
         source=data.get("source", "unknown"),
