@@ -20,7 +20,6 @@ from app.schemas.incident_workflow import IncidentNoteResponse
 from app.schemas.incident_workflow import IncidentActivityResponse
 from app.services.correlation_service import correlate_alerts_into_incidents
 from app.services.incident_service import add_incident_note
-from app.services.incident_service import assign_incident
 from app.services.incident_service import calculate_confidence_level
 from app.services.incident_service import calculate_risk_score
 from app.services.incident_service import create_incident
