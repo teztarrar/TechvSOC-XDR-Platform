@@ -49,7 +49,7 @@ class Incident(TimestampMixin, Base):
     )
     status: Mapped[IncidentStatus] = mapped_column(
         Enum(IncidentStatus, name="incident_status"),
-        default=IncidentStatus.OPEN,
+        default=IncidentStatus.NEW,
         nullable=False,
     )
     attack_chain_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
