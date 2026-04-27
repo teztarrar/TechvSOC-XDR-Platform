@@ -365,7 +365,6 @@ BOOL HttpPost(HTTP_CLIENT* client,
         /* Read response body if caller provided a buffer */
         if (response_buf && response_size > 1) {
             size_t   accumulated = 0;
-            BOOL     body_ok     = TRUE;
             char*    chunk_buf   = (char*)HeapAlloc(
                 GetProcessHeap(), HEAP_ZERO_MEMORY, HTTP_BODY_READ_CHUNK + 1);
 

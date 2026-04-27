@@ -1223,7 +1223,7 @@ static DWORD WINAPI EventWorkerThread(LPVOID param)
     EnterCriticalSection(&g_state.syslog_lock);
     while (g_state.event_queue_head != g_state.event_queue_tail) {
         char* json_obj = g_state.event_queue[g_state.event_queue_head];
-        size_t json_len = g_state.event_queue_lens[g_state.event_queue_head];
+        (void)g_state.event_queue_lens[g_state.event_queue_head];
         g_state.event_queue_head = (g_state.event_queue_head + 1) & EVENT_QUEUE_MASK;
         if (json_obj && g_state.syslog_connected) {
             FormatLogSyslogLine(syslog_line, MAX_SYSLOG_LINE, hostname, json_obj);
@@ -1480,7 +1480,7 @@ static void ShowNotification(DWORD icon_type, const WCHAR* title, const WCHAR* t
     if (!g_state.nid.hWnd) return;
 
     g_state.nid.uFlags    |= NIF_INFO;
-    g_state.nid.dwInfoFlags = icon_type;
+    g_state.nid.dwInfoFlags = NIIF_USER | icon_type;
 
     StringCchCopyW(g_state.nid.szInfoTitle,
                     sizeof(g_state.nid.szInfoTitle) / sizeof(WCHAR),
@@ -1507,7 +1507,7 @@ static BOOL AddTrayIcon(void)
     g_state.nid.uFlags           = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_INFO;
     g_state.nid.uCallbackMessage = WM_TRAYICON;
     g_state.nid.hIcon            = hAppIcon;
-    g_state.nid.dwInfoFlags      = NIIF_NONE;
+    g_state.nid.dwInfoFlags      = NIIF_USER;
     StringCchCopyW(g_state.nid.szTip, sizeof(g_state.nid.szTip) / sizeof(WCHAR),
                     APP_NAME);
 
@@ -1586,11 +1586,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg,
 
 static BOOL RegisterWindowClass(HINSTANCE inst)
 {
+    HICON hAppIcon = LoadIcon(GetModuleHandleW(NULL),
+                               MAKEINTRESOURCE(IDI_APP_ICON));
+    if (!hAppIcon) {
+        hAppIcon = LoadIconW(NULL, IDI_SHIELD);
+    }
+
     WNDCLASSEXW wc;
     memset(&wc, 0, sizeof(wc));
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = WndProc;
     wc.hInstance      = inst;
+    wc.hIcon          = hAppIcon;
+    wc.hIconSm        = hAppIcon;
     wc.lpszClassName  = APP_CLASS;
 
     return (RegisterClassExW(&wc) != 0);
