@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -18,7 +19,31 @@ async def lifespan(app: FastAPI):
         seed_default_rules(db)
     finally:
         db.close()
+
+    # Start syslog TCP receiver if enabled
+    syslog_task: asyncio.Task | None = None
+    if settings.syslog_tcp_enabled:
+        from app.services.syslog_tcp_service import run_syslog_server
+        syslog_task = asyncio.create_task(
+            run_syslog_server(settings.syslog_tcp_host, settings.syslog_tcp_port),
+            name="syslog-tcp-receiver",
+        )
+        import logging
+        logging.getLogger("techvsoc.syslog").info(
+            "Syslog TCP receiver starting on %s:%d",
+            settings.syslog_tcp_host,
+            settings.syslog_tcp_port,
+        )
+
     yield
+
+    # Cancel syslog task on shutdown
+    if syslog_task and not syslog_task.done():
+        syslog_task.cancel()
+        try:
+            await syslog_task
+        except asyncio.CancelledError:
+            pass
 
 
 def create_application() -> FastAPI:

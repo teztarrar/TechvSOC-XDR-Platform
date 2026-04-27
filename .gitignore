@@ -1,4 +1,6 @@
+# ---------------------------------------------------------------
 # Windows agent build artifacts
+# ---------------------------------------------------------------
 agent/windows/*.exe
 agent/windows/*.obj
 agent/windows/*.res
@@ -8,3 +10,57 @@ agent/windows/*.lib
 agent/windows/*.exp
 agent/windows/*.bm
 agent/windows/*.log
+
+# Agent runtime state (auto-generated, contains endpoint IDs + offsets)
+agent/windows/event_forwarder_state.ini
+agent/windows/log_offsets.ini
+
+# ---------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ---------------------------------------------------------------
+# Secrets / credentials
+# ---------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.p12
+*.pfx
+
+# ---------------------------------------------------------------
+# IDE / editor
+# ---------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------
+# Docker
+# ---------------------------------------------------------------
+.dockerignore.local
+
+# ---------------------------------------------------------------
+# Agent state
+# ---------------------------------------------------------------
+.agent-state.json

@@ -1,15 +1,20 @@
 /*
- * Event Forwarding Aggregator - Windows Agent
+ * Event Forwarding Aggregator - Windows Agent v2
  * TechvSOC XDR Platform
  *
- * Native Windows event log forwarding agent using wevtapi.
+ * Native Windows agent: Windows Event Log subscriptions + system metrics
+ * + file log forwarding.
+ * Log shipping: raw TCP syslog RFC 5424 (newline-framed).
+ * Registration + metrics: WinHTTP REST (JWT Bearer auth).
+ *
  * Monitors Palantir WEF-recommended channels for intrusion detection.
- * Forwards events via raw TCP socket (syslog RFC 5424).
  * Minimal system tray interface.
  */
 
 #pragma comment(lib, "wevtapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -22,11 +27,18 @@
 #include <shellapi.h>
 #include <winevt.h>
 #include <strsafe.h>
+#include <iphlpapi.h>
+#include <ws2def.h>
+#include <ws2ipdef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "resource.h"
+#include "http_client.h"
+#include "json_builder.h"
+#include "metrics.h"
+#include "log_reader.h"
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                         */
@@ -38,16 +50,29 @@
 #define IDM_EXIT            1003
 
 #define IDT_STATUS_TIMER    2001
-#define IDT_RECONNECT_TIMER 2002
 
-#define MAX_SYSLOG_MSG      65536
-#define MAX_EVENT_XML       32768
 #define MAX_PATH_LEN        260
 #define MAX_HOST_LEN        256
-#define MAX_PORT_LEN        8
 #define MAX_CHANNELS        32
-#define RECONNECT_INTERVAL  5000   /* ms */
 #define STATUS_INTERVAL     1000   /* ms */
+
+#define MAX_BACKEND_URL     512
+#define MAX_TOKEN_LEN       512
+#define EVENT_QUEUE_SIZE    4096
+#define EVENT_QUEUE_MASK    (EVENT_QUEUE_SIZE - 1)
+#define MAX_EVENT_JSON      65536   /* max bytes for one event JSON object */
+#define STATE_FILENAME      L"event_forwarder_state.ini"
+#define DEFAULT_METRICS_INTERVAL    30
+#define DEFAULT_LOG_INTERVAL        60
+#define DEFAULT_EVENT_FLUSH_INTERVAL 10
+#define DEFAULT_EVENT_FLUSH_BATCH   50
+
+#define MAX_SYSLOG_HOST     256
+#define MAX_SYSLOG_PORT     8
+#define MAX_SYSLOG_LINE     (MAX_EVENT_JSON + 256)  /* RFC 5424 header overhead */
+#define RECONNECT_INTERVAL  5000   /* ms between TCP reconnect attempts */
+#define DEFAULT_SYSLOG_HOST "127.0.0.1"
+#define DEFAULT_SYSLOG_PORT "5514"
 
 #define APP_NAME            L"TechvSOC Event Forwarder"
 #define APP_CLASS           L"TechvSOCEventForwarder"
@@ -55,7 +80,7 @@
 #define BOOKMARK_FILENAME   L"event_forwarder.bm"
 
 /* ------------------------------------------------------------------ */
-/*  All monitored channels (Genral SOC + Palantir WEF comprehensive)       */
+/*  All monitored channels (General SOC + Palantir WEF comprehensive) */
 /*  Covers: Security, System, Application, Sysmon, PowerShell,        */
 /*  Defender, McAfee, Terminal Services, Remote Access, DNS,          */
 /*  TaskScheduler, BITS, Firewall, WMI, Print, DNS Client,            */
@@ -226,13 +251,6 @@ static const DWORD g_key_event_ids[] = {
 /*  Data types                                                        */
 /* ------------------------------------------------------------------ */
 
-/* Linked-list node for the event queue */
-typedef struct _EVENT_NODE {
-    char*               syslog_msg;     /* RFC 5424 formatted message    */
-    size_t              msg_len;
-    struct _EVENT_NODE* next;
-} EVENT_NODE;
-
 /* Per-subscription bookmark state */
 typedef struct _CHANNEL_BOOKMARK {
     const WCHAR*        channel;
@@ -242,35 +260,63 @@ typedef struct _CHANNEL_BOOKMARK {
 /* Global application state */
 typedef struct _APP_STATE {
     /* Configuration */
-    char                syslog_host[MAX_HOST_LEN];
-    char                syslog_port[MAX_PORT_LEN];
     WCHAR               ini_path[MAX_PATH];
     WCHAR               bookmark_path[MAX_PATH];
 
-    /* Networking */
-    SOCKET              sock;
-    BOOL                connected;
-    WSADATA             wsa_data;
+    /* ------------------------------------------------------------------ */
+    /*  Backend configuration                                             */
+    /* ------------------------------------------------------------------ */
+    char    backend_url[512];       /* e.g. "http://localhost:8000/api/v1" */
+    char    backend_token[512];     /* JWT bearer token                     */
+    BOOL    tls_verify;
+    int     metrics_interval;       /* seconds, default 30                  */
+    int     log_interval;           /* seconds, default 60                  */
+    int     event_flush_interval;   /* seconds, default 10                  */
+    int     event_flush_batch;      /* events per HTTP POST, default 50     */
+    char    agent_version[32];
 
-    /* Event queue */
-    CRITICAL_SECTION    queue_lock;
-    EVENT_NODE*         queue_head;
-    EVENT_NODE*         queue_tail;
-    HANDLE              queue_event;        /* manual-reset event */
+    /* ------------------------------------------------------------------ */
+    /*  Syslog TCP (log shipping)                                         */
+    /* ------------------------------------------------------------------ */
+    char    syslog_host[MAX_SYSLOG_HOST];
+    char    syslog_port[MAX_SYSLOG_PORT];
+    SOCKET  syslog_sock;
+    BOOL    syslog_connected;
+    WSADATA wsa_data;
+    CRITICAL_SECTION syslog_lock;   /* protects syslog_sock for multi-thread send */
+
+    /* Endpoint registration */
+    int     endpoint_id;            /* 0 = not yet registered               */
+    WCHAR   state_path[MAX_PATH];   /* INI file for persistent state        */
+
+    /* Log file reader config */
+    LogReaderConfig log_reader_cfg;
+
+    /* Event queue — ring buffer of heap-alloc'd JSON object strings       */
+    CRITICAL_SECTION queue_lock;
+    char*    event_queue[EVENT_QUEUE_SIZE];
+    size_t   event_queue_lens[EVENT_QUEUE_SIZE];
+    int      event_queue_head;
+    int      event_queue_tail;
+    HANDLE   queue_event;
 
     /* Threading */
-    HANDLE              worker_thread;
-    volatile LONG       shutdown;
+    HANDLE   event_worker_thread;
+    HANDLE   metrics_thread;
+    HANDLE   log_reader_thread;
+    volatile LONG shutdown;
+
+    /* Statistics */
+    volatile LONG64 events_collected;
+    volatile LONG64 events_sent;
+    volatile LONG64 metrics_sent;
+    DWORD    start_tick;
 
     /* Subscriptions */
     EVT_HANDLE          subscriptions[MAX_CHANNELS];
     CHANNEL_BOOKMARK    bookmarks[MAX_CHANNELS];
     int                 sub_count;
-    BOOL                channel_active[MAX_CHANNELS]; /* which channels successfully subscribed */
-
-    /* Statistics */
-    volatile LONG64     events_collected;
-    DWORD               start_tick;
+    BOOL                channel_active[MAX_CHANNELS];
 
     /* Windowing */
     HWND                msg_window;
@@ -288,18 +334,44 @@ static APP_STATE g_state;
 static BOOL     LoadConfiguration(void);
 static BOOL     SaveBookmarks(void);
 static BOOL     LoadBookmarks(void);
-static BOOL     ConnectSyslog(void);
-static void     DisconnectSyslog(void);
 static BOOL     StartSubscriptions(void);
 static void     StopSubscriptions(void);
-static BOOL     EnqueueEvent(const char* msg, size_t len);
-static DWORD WINAPI WorkerThread(LPVOID param);
-static void     FormatSyslogMessage(char* buf, size_t bufsz,
-                                     const char* hostname,
-                                     const char* xml);
 static BOOL     IsKeyEventId(DWORD event_id);
 static char*    WideToUtf8Alloc(const WCHAR* wide);
 static BOOL     GetLocalHostname(char* buf, size_t bufsz);
+static BOOL     GetPrimaryIpAddress(char* buf, size_t bufsz);
+static void     GetWindowsVersionString(char* buf, size_t bufsz);
+static void     SaveEndpointId(int id);
+static int      RegisterEndpoint(HTTP_CLIENT* client);
+
+/* Event formatting */
+static BOOL     ExtractXmlField(const char* xml, const char* open_tag,
+                                 const char* close_tag, char* out, size_t outsz);
+static BOOL     ExtractXmlAttr(const char* xml, const char* tag_name,
+                                const char* attr_name, char* out, size_t outsz);
+static const char* WindowsLevelToSeverity(int level);
+static void     FormatWindowsEventJson(char* buf, size_t bufsz,
+                                        const char* xml_utf8,
+                                        int endpoint_id,
+                                        const char* channel_category);
+
+/* Winsock / TCP syslog */
+static BOOL     InitializeWinsock(void);
+static void     CleanupWinsock(void);
+static BOOL     ConnectSyslog(void);
+static void     DisconnectSyslog(void);
+static BOOL     SyslogSendAll(const char* data, size_t len);
+static void     FormatLogSyslogLine(char* buf, size_t bufsz,
+                                     const char* hostname,
+                                     const char* json_payload);
+static void     FormatLREntryJson(char* buf, size_t bufsz,
+                                   const LRLogEntry* entry);
+static BOOL     EnqueueLogJson(const char* json, size_t len);
+
+/* Worker threads */
+static DWORD WINAPI EventWorkerThread(LPVOID param);
+static DWORD WINAPI MetricsThread(LPVOID param);
+static DWORD WINAPI LogReaderThread(LPVOID param);
 
 /* Window / tray */
 static BOOL     RegisterWindowClass(HINSTANCE inst);
@@ -328,18 +400,6 @@ static char* WideToUtf8Alloc(const WCHAR* wide)
     if (!utf8) return NULL;
     WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, len, NULL, NULL);
     return utf8;
-}
-
-static WCHAR* Utf8ToWideAlloc(const char* utf8)
-{
-    if (!utf8) return NULL;
-    int len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
-    if (len <= 0) return NULL;
-    WCHAR* wide = (WCHAR*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-                                     (size_t)len * sizeof(WCHAR));
-    if (!wide) return NULL;
-    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, len);
-    return wide;
 }
 
 static BOOL GetLocalHostname(char* buf, size_t bufsz)
@@ -371,6 +431,63 @@ static void GetIniString(const WCHAR* section, const WCHAR* key,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Network helpers                                                   */
+/* ------------------------------------------------------------------ */
+
+static BOOL GetPrimaryIpAddress(char* buf, size_t bufsz)
+{
+    /* Use GetAdaptersAddresses to find first non-loopback IPv4 address */
+    ULONG size = 0;
+    GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_ANYCAST |
+                         GAA_FLAG_SKIP_DNS_SERVER, NULL, NULL, &size);
+    if (size == 0) { StringCchCopyA(buf, bufsz, "0.0.0.0"); return FALSE; }
+
+    PIP_ADAPTER_ADDRESSES addrs = (PIP_ADAPTER_ADDRESSES)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, size);
+    if (!addrs) { StringCchCopyA(buf, bufsz, "0.0.0.0"); return FALSE; }
+
+    BOOL found = FALSE;
+    if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_ANYCAST |
+                              GAA_FLAG_SKIP_DNS_SERVER, NULL, addrs, &size) == NO_ERROR) {
+        PIP_ADAPTER_ADDRESSES a;
+        for (a = addrs; a && !found; a = a->Next) {
+            if (a->OperStatus != IfOperStatusUp) continue;
+            if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+            PIP_ADAPTER_UNICAST_ADDRESS ua;
+            for (ua = a->FirstUnicastAddress; ua && !found; ua = ua->Next) {
+                struct sockaddr_in* sa = (struct sockaddr_in*)ua->Address.lpSockaddr;
+                if (sa->sin_family == AF_INET) {
+                    DWORD ip = ntohl(sa->sin_addr.S_un.S_addr);
+                    StringCchPrintfA(buf, bufsz, "%d.%d.%d.%d",
+                        (ip>>24)&0xFF,(ip>>16)&0xFF,(ip>>8)&0xFF,ip&0xFF);
+                    found = TRUE;
+                }
+            }
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, addrs);
+    if (!found) StringCchCopyA(buf, bufsz, "0.0.0.0");
+    return found;
+}
+
+typedef LONG(WINAPI* RtlGetVersionFn)(OSVERSIONINFOW*);
+static void GetWindowsVersionString(char* buf, size_t bufsz)
+{
+    OSVERSIONINFOW vi;
+    vi.dwOSVersionInfoSize = sizeof(vi);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    RtlGetVersionFn fn = ntdll
+        ? (RtlGetVersionFn)GetProcAddress(ntdll, "RtlGetVersion")
+        : NULL;
+    if (fn && fn(&vi) == 0) {
+        StringCchPrintfA(buf, bufsz, "Windows %lu.%lu Build %lu",
+            vi.dwMajorVersion, vi.dwMinorVersion, vi.dwBuildNumber);
+    } else {
+        StringCchCopyA(buf, bufsz, "Windows");
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Configuration                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -380,33 +497,249 @@ static BOOL LoadConfiguration(void)
     WCHAR exe_path[MAX_PATH];
     GetModuleFileNameW(NULL, exe_path, MAX_PATH);
 
-    /* Find last backslash */
+    /* Find last backslash — extract directory */
     WCHAR* slash = wcsrchr(exe_path, L'\\');
     if (!slash) {
         return FALSE;
     }
     *(slash + 1) = L'\0';
+    /* exe_path is now the directory (with trailing backslash) */
+    WCHAR exe_dir[MAX_PATH];
+    StringCchCopyW(exe_dir, MAX_PATH, exe_path);
 
-    StringCchCopyW(g_state.ini_path, MAX_PATH, exe_path);
+    StringCchCopyW(g_state.ini_path, MAX_PATH, exe_dir);
     StringCchCatW(g_state.ini_path, MAX_PATH, INI_FILENAME);
 
-    StringCchCopyW(g_state.bookmark_path, MAX_PATH, exe_path);
+    StringCchCopyW(g_state.bookmark_path, MAX_PATH, exe_dir);
     StringCchCatW(g_state.bookmark_path, MAX_PATH, BOOKMARK_FILENAME);
 
-    /* Read settings */
-    WCHAR whost[MAX_HOST_LEN];
-    WCHAR wport[MAX_PORT_LEN];
+    WCHAR wval[MAX_BACKEND_URL];
 
-    GetIniString(L"syslog", L"host", L"127.0.0.1", whost, MAX_HOST_LEN);
-    GetIniString(L"syslog", L"port", L"514", wport, MAX_PORT_LEN);
+    /* [backend] */
+    GetIniString(L"backend", L"url", L"http://localhost:8000/api/v1", wval, MAX_BACKEND_URL);
+    WideCharToMultiByte(CP_UTF8, 0, wval, -1, g_state.backend_url, MAX_BACKEND_URL, NULL, NULL);
 
-    /* Convert to UTF-8 for socket operations */
-    WideCharToMultiByte(CP_UTF8, 0, whost, -1,
-                        g_state.syslog_host, MAX_HOST_LEN, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wport, -1,
-                        g_state.syslog_port, MAX_PORT_LEN, NULL, NULL);
+    GetIniString(L"backend", L"token", L"", wval, MAX_TOKEN_LEN);
+    WideCharToMultiByte(CP_UTF8, 0, wval, -1, g_state.backend_token, MAX_TOKEN_LEN, NULL, NULL);
+
+    GetIniString(L"backend", L"tls_verify", L"1", wval, 8);
+    g_state.tls_verify = (_wtoi(wval) != 0);
+
+    /* [syslog] — TCP log shipping */
+    WCHAR wsyslog_host[MAX_SYSLOG_HOST];
+    WCHAR wsyslog_port[MAX_SYSLOG_PORT];
+    GetIniString(L"syslog", L"host", L"127.0.0.1", wsyslog_host, MAX_SYSLOG_HOST);
+    GetIniString(L"syslog", L"port", L"5514",       wsyslog_port, MAX_SYSLOG_PORT);
+    WideCharToMultiByte(CP_UTF8, 0, wsyslog_host, -1,
+                        g_state.syslog_host, MAX_SYSLOG_HOST, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wsyslog_port, -1,
+                        g_state.syslog_port, MAX_SYSLOG_PORT, NULL, NULL);
+
+    /* [agent] */
+    g_state.metrics_interval    = GetPrivateProfileIntW(L"agent", L"metrics_interval",    DEFAULT_METRICS_INTERVAL,     g_state.ini_path);
+    g_state.log_interval        = GetPrivateProfileIntW(L"agent", L"log_interval",         DEFAULT_LOG_INTERVAL,          g_state.ini_path);
+    g_state.event_flush_interval= GetPrivateProfileIntW(L"agent", L"event_flush_interval", DEFAULT_EVENT_FLUSH_INTERVAL,  g_state.ini_path);
+    g_state.event_flush_batch   = GetPrivateProfileIntW(L"agent", L"event_flush_batch",    DEFAULT_EVENT_FLUSH_BATCH,     g_state.ini_path);
+    g_state.endpoint_id         = GetPrivateProfileIntW(L"agent", L"endpoint_id",          0,                             g_state.ini_path);
+
+    GetIniString(L"agent", L"version", L"2.0.0", wval, 32);
+    WideCharToMultiByte(CP_UTF8, 0, wval, -1, g_state.agent_version, 32, NULL, NULL);
+
+    /* Build state path */
+    StringCchCopyW(g_state.state_path, MAX_PATH, exe_dir);
+    StringCchCatW(g_state.state_path, MAX_PATH, STATE_FILENAME);
+
+    /* [log_files] */
+    int log_count = GetPrivateProfileIntW(L"log_files", L"count", 0, g_state.ini_path);
+    g_state.log_reader_cfg.count = 0;
+    int i;
+    for (i = 1; i <= log_count && i <= LR_MAX_FILES; i++) {
+        WCHAR key[32], val[MAX_PATH];
+        StringCchPrintfW(key, 32, L"file_%02d", i);
+        GetPrivateProfileStringW(L"log_files", key, L"", val, MAX_PATH, g_state.ini_path);
+        if (val[0]) {
+            StringCchCopyW(g_state.log_reader_cfg.paths[g_state.log_reader_cfg.count++],
+                           LR_MAX_PATH, val);
+        }
+    }
+    /* offset file: same dir as state file, named log_offsets.ini */
+    StringCchCopyW(g_state.log_reader_cfg.offset_file, LR_MAX_PATH, exe_dir);
+    StringCchCatW(g_state.log_reader_cfg.offset_file, LR_MAX_PATH, L"log_offsets.ini");
 
     return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Winsock / TCP syslog                                              */
+/* ------------------------------------------------------------------ */
+
+static BOOL InitializeWinsock(void)
+{
+    return (WSAStartup(MAKEWORD(2, 2), &g_state.wsa_data) == 0);
+}
+
+static void CleanupWinsock(void)
+{
+    WSACleanup();
+}
+
+static BOOL ConnectSyslog(void)
+{
+    if (g_state.syslog_connected) return TRUE;
+
+    struct addrinfo hints, *result = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    if (getaddrinfo(g_state.syslog_host, g_state.syslog_port, &hints, &result) != 0)
+        return FALSE;
+
+    g_state.syslog_sock = socket(result->ai_family, result->ai_socktype,
+                                  result->ai_protocol);
+    if (g_state.syslog_sock == INVALID_SOCKET) {
+        freeaddrinfo(result);
+        return FALSE;
+    }
+
+    /* 10-second send timeout */
+    DWORD timeout = 10000;
+    setsockopt(g_state.syslog_sock, SOL_SOCKET, SO_SNDTIMEO,
+               (const char*)&timeout, sizeof(timeout));
+
+    /* TCP_NODELAY for low-latency streaming */
+    int nodelay = 1;
+    setsockopt(g_state.syslog_sock, IPPROTO_TCP, TCP_NODELAY,
+               (const char*)&nodelay, sizeof(nodelay));
+
+    if (connect(g_state.syslog_sock, result->ai_addr,
+                (int)result->ai_addrlen) == SOCKET_ERROR) {
+        closesocket(g_state.syslog_sock);
+        g_state.syslog_sock = INVALID_SOCKET;
+        freeaddrinfo(result);
+        return FALSE;
+    }
+
+    freeaddrinfo(result);
+    g_state.syslog_connected = TRUE;
+    return TRUE;
+}
+
+static void DisconnectSyslog(void)
+{
+    if (g_state.syslog_sock != INVALID_SOCKET) {
+        shutdown(g_state.syslog_sock, SD_BOTH);
+        closesocket(g_state.syslog_sock);
+        g_state.syslog_sock = INVALID_SOCKET;
+    }
+    g_state.syslog_connected = FALSE;
+}
+
+static BOOL SyslogSendAll(const char* data, size_t len)
+{
+    size_t sent = 0;
+    while (sent < len) {
+        int n = send(g_state.syslog_sock, data + sent, (int)(len - sent), 0);
+        if (n == SOCKET_ERROR) return FALSE;
+        sent += (size_t)n;
+    }
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Log formatting helpers                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * FormatLogSyslogLine — wrap a JSON LogEventPayload in RFC 5424.
+ * Output: "<134>1 TIMESTAMP HOSTNAME TECHVSOC-AGENT PROCID - - {json}\n"
+ * Always NUL-terminates. Truncates gracefully.
+ */
+static void FormatLogSyslogLine(char*       buf,
+                                 size_t      bufsz,
+                                 const char* hostname,
+                                 const char* json_payload)
+{
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    char ts[32];
+    StringCchPrintfA(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+    /* PRI = local0(16)*8 + info(6) = 134 */
+    StringCchPrintfA(buf, bufsz,
+        "<134>1 %s %s TECHVSOC-AGENT %lu - - %s\n",
+        ts,
+        (hostname && hostname[0]) ? hostname : "-",
+        (unsigned long)GetCurrentProcessId(),
+        json_payload ? json_payload : "{}");
+}
+
+/*
+ * FormatLREntryJson — convert an LRLogEntry to a LogEventPayload JSON object.
+ * Used by LogReaderThread to enqueue file-log entries into the shared ring buffer.
+ */
+static void FormatLREntryJson(char* buf, size_t bufsz, const LRLogEntry* e)
+{
+    JsonBuilder jb;
+    JsonInit(&jb, buf, bufsz);
+    JsonObjectBegin(&jb);
+    JsonStr    (&jb, "source",          e->source);
+    JsonStr    (&jb, "event_type",      e->event_type);
+    JsonStr    (&jb, "message",         e->message);
+    JsonStr    (&jb, "raw_log",         e->raw_log);
+    JsonStr    (&jb, "severity",        e->severity);
+    JsonStr    (&jb, "event_timestamp", e->event_timestamp);
+    if (e->endpoint_id > 0)
+        JsonInt(&jb, "endpoint_id",     e->endpoint_id);
+    JsonNestedObjectBegin(&jb, "metadata_json");
+    JsonStr    (&jb, "file_path",       e->file_path);
+    JsonStr    (&jb, "source_type",     "file_log");
+    JsonNestedObjectEnd(&jb);
+    JsonObjectEnd(&jb);
+    JsonFinish(&jb);
+}
+
+/*
+ * EnqueueLogJson — thread-safe push to event ring buffer.
+ * Takes ownership of a heap-allocated JSON string.
+ * Drops oldest entry if queue full.
+ */
+static BOOL EnqueueLogJson(const char* json, size_t len)
+{
+    char* copy = (char*)HeapAlloc(GetProcessHeap(), 0, len + 1);
+    if (!copy) return FALSE;
+    memcpy(copy, json, len);
+    copy[len] = '\0';
+
+    EnterCriticalSection(&g_state.queue_lock);
+    int next_tail = (g_state.event_queue_tail + 1) & EVENT_QUEUE_MASK;
+    if (next_tail == g_state.event_queue_head) {
+        /* Queue full — drop oldest */
+        HeapFree(GetProcessHeap(), 0, g_state.event_queue[g_state.event_queue_head]);
+        g_state.event_queue[g_state.event_queue_head] = NULL;
+        g_state.event_queue_head = (g_state.event_queue_head + 1) & EVENT_QUEUE_MASK;
+    }
+    g_state.event_queue[g_state.event_queue_tail]      = copy;
+    g_state.event_queue_lens[g_state.event_queue_tail] = len;
+    g_state.event_queue_tail = next_tail;
+    LeaveCriticalSection(&g_state.queue_lock);
+
+    SetEvent(g_state.queue_event);
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Endpoint registration persistence                                 */
+/* ------------------------------------------------------------------ */
+
+static void SaveEndpointId(int id)
+{
+    WCHAR val[32];
+    StringCchPrintfW(val, 32, L"%d", id);
+    WritePrivateProfileStringW(L"agent", L"endpoint_id", val, g_state.ini_path);
 }
 
 /* ------------------------------------------------------------------ */
@@ -415,19 +748,13 @@ static BOOL LoadConfiguration(void)
 
 static BOOL SaveBookmarks(void)
 {
-    /*
-     * Save each channel bookmark XML to the bookmark file.
-     * Format: [channel_name_xml] key=bookmark_xml
-     * We store the bookmark XML returned by EvtRender for each channel.
-     */
-    for (int i = 0; i < g_state.sub_count; i++) {
+    int i;
+    for (i = 0; i < g_state.sub_count; i++) {
         if (!g_state.bookmarks[i].bookmark)
             continue;
 
-        /* Render bookmark to XML */
         DWORD prop_count = 0;
         DWORD buffer_size = 0;
-        /* Render the bookmark as XML string */
         if (!EvtRender(NULL, g_state.bookmarks[i].bookmark,
                         EvtRenderBookmark, 0, NULL,
                         &buffer_size, &prop_count)) {
@@ -446,7 +773,6 @@ static BOOL SaveBookmarks(void)
             continue;
         }
 
-        /* Escape: convert bookmark XML to a single line for INI storage */
         WritePrivateProfileStringW(g_state.bookmarks[i].channel,
                                     L"bookmark",
                                     bm_xml,
@@ -458,7 +784,8 @@ static BOOL SaveBookmarks(void)
 
 static BOOL LoadBookmarks(void)
 {
-    for (int i = 0; i < CHANNEL_COUNT; i++) {
+    int i;
+    for (i = 0; i < (int)CHANNEL_COUNT; i++) {
         WCHAR bm_xml[MAX_PATH * 4] = { 0 };
         GetPrivateProfileStringW(g_channel_entries[i].name, L"bookmark", L"",
                                   bm_xml, MAX_PATH * 4,
@@ -467,7 +794,6 @@ static BOOL LoadBookmarks(void)
         if (wcslen(bm_xml) > 0) {
             g_state.bookmarks[i].bookmark = EvtCreateBookmark(bm_xml);
             if (!g_state.bookmarks[i].bookmark) {
-                /* If bookmark is stale/invalid, start fresh */
                 g_state.bookmarks[i].bookmark = NULL;
             }
         }
@@ -477,306 +803,163 @@ static BOOL LoadBookmarks(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  TCP / Syslog networking                                           */
+/*  Endpoint registration                                             */
 /* ------------------------------------------------------------------ */
 
-static BOOL InitializeWinsock(void)
+static int RegisterEndpoint(HTTP_CLIENT* client)
 {
-    int rc = WSAStartup(MAKEWORD(2, 2), &g_state.wsa_data);
-    if (rc != 0) {
-        return FALSE;
-    }
-    return TRUE;
-}
-
-static void CleanupWinsock(void)
-{
-    WSACleanup();
-}
-
-static BOOL ConnectSyslog(void)
-{
-    if (g_state.connected) {
-        return TRUE;
-    }
-
-    struct addrinfo hints, *result = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-
-    int rc = getaddrinfo(g_state.syslog_host, g_state.syslog_port,
-                         &hints, &result);
-    if (rc != 0) {
-        return FALSE;
-    }
-
-    g_state.sock = socket(result->ai_family, result->ai_socktype,
-                          result->ai_protocol);
-    if (g_state.sock == INVALID_SOCKET) {
-        freeaddrinfo(result);
-        return FALSE;
-    }
-
-    /* Set a 10-second send timeout */
-    DWORD timeout = 10000;
-    setsockopt(g_state.sock, SOL_SOCKET, SO_SNDTIMEO,
-               (const char*)&timeout, sizeof(timeout));
-
-    /* Set TCP_NODELAY for low-latency forwarding */
-    int nodelay = 1;
-    setsockopt(g_state.sock, IPPROTO_TCP, TCP_NODELAY,
-               (const char*)&nodelay, sizeof(nodelay));
-
-    if (connect(g_state.sock, result->ai_addr, (int)result->ai_addrlen)
-        == SOCKET_ERROR) {
-        closesocket(g_state.sock);
-        g_state.sock = INVALID_SOCKET;
-        freeaddrinfo(result);
-        return FALSE;
-    }
-
-    freeaddrinfo(result);
-    g_state.connected = TRUE;
-    return TRUE;
-}
-
-static void DisconnectSyslog(void)
-{
-    if (g_state.sock != INVALID_SOCKET) {
-        shutdown(g_state.sock, SD_BOTH);
-        closesocket(g_state.sock);
-        g_state.sock = INVALID_SOCKET;
-    }
-    g_state.connected = FALSE;
-}
-
-static BOOL SendAll(const char* data, size_t len)
-{
-    size_t total_sent = 0;
-    while (total_sent < len) {
-        int sent = send(g_state.sock, data + total_sent,
-                        (int)(len - total_sent), 0);
-        if (sent == SOCKET_ERROR) {
-            return FALSE;
-        }
-        total_sent += (size_t)sent;
-    }
-    return TRUE;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Syslog RFC 5424 formatting                                        */
-/* ------------------------------------------------------------------ */
-
-/*
- * RFC 5424 format:
- *   <PRI>VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID SD MSG
- *
- * Example:
- *   <165>1 2024-01-15T12:34:56.000Z myhost WEF 1234 - [wef meta] message
- *
- * We embed the Windows event XML as the message body.
- */
-static void FormatSyslogMessage(char* buf, size_t bufsz,
-                                 const char* hostname,
-                                 const char* xml)
-{
-    /* PRI = facility(local0=128) + severity(info=6) = 134 */
-    int pri = 134;
-    const char* version = "1";
-
-    /* Timestamp in ISO 8601 */
-    SYSTEMTIME st;
-    GetSystemTime(&st);
-
-    char timestamp[64];
-    StringCchPrintfA(timestamp, sizeof(timestamp),
-        "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-        st.wYear, st.wMonth, st.wDay,
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-
-    /*
-     * We replace any newlines in XML with spaces to keep the syslog
-     * message on one line.
-     */
-    char* clean_xml = (char*)HeapAlloc(GetProcessHeap(), 0,
-                                        strlen(xml) + 1);
-    if (clean_xml) {
-        size_t i = 0;
-        const char* p = xml;
-        while (*p) {
-            if (*p == '\r' || *p == '\n') {
-                clean_xml[i++] = ' ';
-                p++;
-                /* skip consecutive whitespace */
-                while (*p == '\r' || *p == '\n' || *p == ' ' || *p == '\t')
-                    p++;
-            } else {
-                clean_xml[i++] = *p++;
-            }
-        }
-        clean_xml[i] = '\0';
-    } else {
-        clean_xml = (char*)xml;  /* fallback, not ideal */
-    }
-
-    StringCchPrintfA(buf, bufsz,
-        "<%d>%s %s %s WEF %lu - %s",
-        pri, version, timestamp,
-        hostname ? hostname : "-",
-        GetCurrentProcessId(),
-        clean_xml);
-
-    if (clean_xml != xml && clean_xml) {
-        HeapFree(GetProcessHeap(), 0, clean_xml);
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/*  Event queue (thread-safe linked list)                             */
-/* ------------------------------------------------------------------ */
-
-static BOOL EnqueueEvent(const char* msg, size_t len)
-{
-    EVENT_NODE* node = (EVENT_NODE*)HeapAlloc(GetProcessHeap(),
-                                               HEAP_ZERO_MEMORY,
-                                               sizeof(EVENT_NODE));
-    if (!node) return FALSE;
-
-    node->syslog_msg = (char*)HeapAlloc(GetProcessHeap(), 0, len + 1);
-    if (!node->syslog_msg) {
-        HeapFree(GetProcessHeap(), 0, node);
-        return FALSE;
-    }
-    memcpy(node->syslog_msg, msg, len);
-    node->syslog_msg[len] = '\0';
-    node->msg_len = len;
-    node->next = NULL;
-
-    EnterCriticalSection(&g_state.queue_lock);
-
-    if (g_state.queue_tail) {
-        g_state.queue_tail->next = node;
-    } else {
-        g_state.queue_head = node;
-    }
-    g_state.queue_tail = node;
-
-    LeaveCriticalSection(&g_state.queue_lock);
-
-    /* Signal worker thread that an event is available */
-    SetEvent(g_state.queue_event);
-
-    return TRUE;
-}
-
-static EVENT_NODE* DequeueEvent(void)
-{
-    EVENT_NODE* node = NULL;
-
-    EnterCriticalSection(&g_state.queue_lock);
-    if (g_state.queue_head) {
-        node = g_state.queue_head;
-        g_state.queue_head = node->next;
-        if (!g_state.queue_head) {
-            g_state.queue_tail = NULL;
-        }
-    }
-    LeaveCriticalSection(&g_state.queue_lock);
-
-    return node;
-}
-
-static void FreeEventNode(EVENT_NODE* node)
-{
-    if (node) {
-        if (node->syslog_msg) {
-            HeapFree(GetProcessHeap(), 0, node->syslog_msg);
-        }
-        HeapFree(GetProcessHeap(), 0, node);
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/*  Worker thread: dequeues events and sends via TCP                  */
-/* ------------------------------------------------------------------ */
-
-static DWORD WINAPI WorkerThread(LPVOID param)
-{
-    UNREFERENCED_PARAMETER(param);
-
-    HANDLE handles[2];
-    handles[0] = g_state.queue_event;
-    handles[1] = CreateEventW(NULL, TRUE, FALSE, NULL);
-    /* handles[1] is never signaled from outside — we use shutdown flag */
-
-    char hostname[256] = { 0 };
+    char hostname[256] = {0};
     GetLocalHostname(hostname, sizeof(hostname));
 
-    while (!g_state.shutdown) {
-        /* Attempt to connect if not connected */
-        if (!g_state.connected) {
-            if (!ConnectSyslog()) {
-                /* Wait before retrying */
-                Sleep(RECONNECT_INTERVAL);
-                continue;
-            }
-            /* Connection established — show balloon notification */
-            {
-                WCHAR msg[256];
-                StringCchPrintfW(msg, 256, L"Connected to syslog collector at %S:%S",
-                    g_state.syslog_host, g_state.syslog_port);
-                ShowNotification(NIIF_INFO, APP_NAME, msg);
-            }
-        }
+    char ip[64] = {0};
+    GetPrimaryIpAddress(ip, sizeof(ip));
 
-        /* Wait for an event or shutdown */
-        DWORD wait = WaitForSingleObject(g_state.queue_event, 1000);
-        if (g_state.shutdown)
-            break;
+    char os_ver[128] = {0};
+    GetWindowsVersionString(os_ver, sizeof(os_ver));
 
-        if (wait == WAIT_OBJECT_0) {
-            /* Drain the queue */
-            for (;;) {
-                EVENT_NODE* node = DequeueEvent();
-                if (!node) break;
+    /* Build JSON matching Python EndpointRegistrationPayload model */
+    char json_buf[2048];
+    JsonBuilder b;
+    JsonInit(&b, json_buf, sizeof(json_buf));
+    JsonObjectBegin(&b);
+    JsonStr(&b, "hostname",         hostname);
+    JsonStr(&b, "ip_address",       ip);
+    JsonStr(&b, "operating_system", os_ver);
+    JsonStr(&b, "agent_version",    g_state.agent_version);
+    JsonStr(&b, "status",           "online");
+    JsonStr(&b, "last_seen_ip",     ip);
+    JsonStr(&b, "notes",            "Registered by TechvSOC XDR Native Agent");
+    JsonObjectEnd(&b);
+    JsonFinish(&b);
 
-                /* Try to send */
-                if (!SendAll(node->syslog_msg, node->msg_len)) {
-                    /* Send failed — disconnect and requeue */
-                    DisconnectSyslog();
-                    ShowNotification(NIIF_WARNING, APP_NAME,
-                        L"Connection lost - reconnecting...");
-                    FreeEventNode(node);
-                    break;
-                }
-
-                FreeEventNode(node);
-            }
-        }
-
-        /* Reset the event if queue is empty */
-        EnterCriticalSection(&g_state.queue_lock);
-        if (!g_state.queue_head) {
-            ResetEvent(g_state.queue_event);
-        }
-        LeaveCriticalSection(&g_state.queue_lock);
+    char resp[1024] = {0};
+    int status = 0;
+    if (!HttpPost(client, "/monitoring/endpoints/register",
+                  json_buf, resp, sizeof(resp), &status)) {
+        return 0;
     }
 
-    /* Drain remaining events on shutdown */
-    for (;;) {
-        EVENT_NODE* node = DequeueEvent();
-        if (!node) break;
-        if (g_state.connected) {
-            SendAll(node->syslog_msg, node->msg_len);
-        }
-        FreeEventNode(node);
+    /* Parse "id" from response JSON: find "\"id\":" then integer */
+    const char* id_pos = strstr(resp, "\"id\":");
+    if (!id_pos) id_pos = strstr(resp, "\"id\" :");
+    if (id_pos) {
+        id_pos += 5;
+        while (*id_pos == ' ') id_pos++;
+        int id = atoi(id_pos);
+        if (id > 0) return id;
     }
-
-    CloseHandle(handles[1]);
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  XML parsing helpers for Windows Event XML                         */
+/* ------------------------------------------------------------------ */
+
+static BOOL ExtractXmlField(const char* xml, const char* open_tag,
+                              const char* close_tag, char* out, size_t outsz)
+{
+    const char* p = strstr(xml, open_tag);
+    if (!p) return FALSE;
+    p += strlen(open_tag);
+    const char* q = strstr(p, close_tag);
+    if (!q) return FALSE;
+    size_t len = (size_t)(q - p);
+    if (len >= outsz) len = outsz - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return TRUE;
+}
+
+/* Extract attribute value from: <Tag AttrName='value' ... */
+static BOOL ExtractXmlAttr(const char* xml, const char* tag_name,
+                             const char* attr_name, char* out, size_t outsz)
+{
+    char search[256];
+    StringCchPrintfA(search, sizeof(search), "<%s ", tag_name);
+    const char* tag = strstr(xml, search);
+    if (!tag) return FALSE;
+
+    char attr_search[256];
+    StringCchPrintfA(attr_search, sizeof(attr_search), "%s='", attr_name);
+    const char* attr = strstr(tag, attr_search);
+    if (!attr) return FALSE;
+    attr += strlen(attr_search);
+
+    const char* end = strchr(attr, '\'');
+    if (!end) return FALSE;
+    size_t len = (size_t)(end - attr);
+    if (len >= outsz) len = outsz - 1;
+    memcpy(out, attr, len);
+    out[len] = '\0';
+    return TRUE;
+}
+
+static const char* WindowsLevelToSeverity(int level)
+{
+    switch (level) {
+    case 1:  return "critical";
+    case 2:  return "error";
+    case 3:  return "warning";
+    case 4:  return "info";
+    case 5:  return "debug";
+    default: return "info";
+    }
+}
+
+static void FormatWindowsEventJson(char*       buf,
+                                    size_t      bufsz,
+                                    const char* xml_utf8,
+                                    int         endpoint_id,
+                                    const char* channel_category)
+{
+    char event_id[32]    = "0";
+    char level_str[8]    = "4";
+    char channel[256]    = "";
+    char computer[256]   = "";
+    char time_created[64]= "";
+
+    ExtractXmlField(xml_utf8, "<EventID>",   "</EventID>",   event_id,    sizeof(event_id));
+    ExtractXmlField(xml_utf8, "<Level>",     "</Level>",     level_str,   sizeof(level_str));
+    ExtractXmlField(xml_utf8, "<Channel>",   "</Channel>",   channel,     sizeof(channel));
+    ExtractXmlField(xml_utf8, "<Computer>",  "</Computer>",  computer,    sizeof(computer));
+    ExtractXmlAttr (xml_utf8, "TimeCreated", "SystemTime",   time_created,sizeof(time_created));
+
+    int level     = atoi(level_str);
+    int evid      = atoi(event_id);
+    const char* sev = WindowsLevelToSeverity(level);
+
+    /* Human-readable summary message */
+    char message[512];
+    StringCchPrintfA(message, sizeof(message),
+        "Windows Event ID %s on %s [%s]",
+        event_id,
+        computer[0] ? computer : "unknown",
+        channel[0]  ? channel  : (channel_category ? channel_category : "Unknown"));
+
+    /* Truncate XML to 10000 chars for raw_log */
+    char raw_log[10001];
+    StringCchCopyA(raw_log, sizeof(raw_log), xml_utf8);  /* truncates at 10000 */
+
+    /* Build JSON object */
+    JsonBuilder jb;
+    JsonInit(&jb, buf, bufsz);
+    JsonObjectBegin(&jb);
+    JsonStr    (&jb, "source",          channel[0] ? channel : "windows_event");
+    JsonStr    (&jb, "event_type",      "windows_event");
+    JsonStr    (&jb, "message",         message);
+    JsonStr    (&jb, "raw_log",         raw_log);
+    JsonStr    (&jb, "severity",        sev);
+    JsonStr    (&jb, "event_timestamp", time_created[0] ? time_created : "");
+    if (endpoint_id > 0)
+        JsonInt(&jb, "endpoint_id",     endpoint_id);
+    JsonNestedObjectBegin(&jb, "metadata_json");
+    JsonInt    (&jb, "event_id",        evid);
+    JsonStr    (&jb, "channel",         channel);
+    JsonInt    (&jb, "level",           level);
+    JsonStr    (&jb, "computer",        computer);
+    JsonNestedObjectEnd(&jb);
+    JsonObjectEnd(&jb);
+    JsonFinish(&jb);
 }
 
 /* ------------------------------------------------------------------ */
@@ -786,8 +969,6 @@ static DWORD WINAPI WorkerThread(LPVOID param)
 static DWORD WINAPI EventCallback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
                                    PVOID context, EVT_HANDLE event)
 {
-    UNREFERENCED_PARAMETER(context);
-
     if (action != EvtSubscribeActionDeliver) {
         return ERROR_SUCCESS;
     }
@@ -823,17 +1004,11 @@ static DWORD WINAPI EventCallback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
     if (!xml_utf8) return ERROR_SUCCESS;
 
     /* Update bookmark for this subscription channel */
-    /* (We find the channel by the subscription context, but we update
-       all bookmarks from each event for simplicity.) */
     EVT_HANDLE bm = EvtCreateBookmark(NULL);
     if (bm) {
         EvtUpdateBookmark(bm, event);
-        /* Store in the first available bookmark slot */
-        /* We just update all — the actual per-channel tracking is via
-           the subscription handle, but for simplicity we maintain one
-           bookmark per subscription. */
         int idx = (int)(LONG_PTR)context;
-        if (idx >= 0 && idx < CHANNEL_COUNT) {
+        if (idx >= 0 && idx < (int)CHANNEL_COUNT) {
             if (g_state.bookmarks[idx].bookmark) {
                 EvtClose(g_state.bookmarks[idx].bookmark);
             }
@@ -843,19 +1018,24 @@ static DWORD WINAPI EventCallback(EVT_SUBSCRIBE_NOTIFY_ACTION action,
         }
     }
 
-    /* Format as syslog RFC 5424 */
-    char hostname[256] = { 0 };
-    GetLocalHostname(hostname, sizeof(hostname));
+    /* Format as JSON log entry */
+    char* json_buf = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, MAX_EVENT_JSON);
+    if (!json_buf) { HeapFree(GetProcessHeap(), 0, xml_utf8); return ERROR_SUCCESS; }
 
-    char syslog_msg[MAX_SYSLOG_MSG];
-    FormatSyslogMessage(syslog_msg, sizeof(syslog_msg), hostname, xml_utf8);
+    /* Find channel_category for this subscription index */
+    const char* cat = NULL;
+    int idx = (int)(LONG_PTR)context;
+    if (idx >= 0 && idx < (int)CHANNEL_COUNT && g_channel_entries[idx].category)
+        cat = WideToUtf8Alloc(g_channel_entries[idx].category);
+
+    FormatWindowsEventJson(json_buf, MAX_EVENT_JSON, xml_utf8, g_state.endpoint_id, cat);
+    if (cat) HeapFree(GetProcessHeap(), 0, (void*)cat);
     HeapFree(GetProcessHeap(), 0, xml_utf8);
 
-    /* Enqueue for the worker thread */
-    size_t msg_len = strlen(syslog_msg);
-    EnqueueEvent(syslog_msg, msg_len);
+    size_t json_len = strlen(json_buf);
+    EnqueueLogJson(json_buf, json_len);
+    HeapFree(GetProcessHeap(), 0, json_buf);
 
-    /* Increment counter */
     InterlockedIncrement64(&g_state.events_collected);
 
     return ERROR_SUCCESS;
@@ -872,7 +1052,8 @@ static BOOL StartSubscriptions(void)
 
     LoadBookmarks();
 
-    for (int i = 0; i < (int)CHANNEL_COUNT; i++) {
+    int i;
+    for (i = 0; i < (int)CHANNEL_COUNT; i++) {
         EVT_HANDLE bookmark = g_state.bookmarks[i].bookmark;
         DWORD flags = EvtSubscribeToFutureEvents;
 
@@ -921,10 +1102,11 @@ static BOOL StartSubscriptions(void)
 
 static void StopSubscriptions(void)
 {
+    int i;
     /* Save bookmarks before closing subscriptions */
     SaveBookmarks();
 
-    for (int i = 0; i < g_state.sub_count; i++) {
+    for (i = 0; i < g_state.sub_count; i++) {
         if (g_state.subscriptions[i]) {
             EvtClose(g_state.subscriptions[i]);
             g_state.subscriptions[i] = NULL;
@@ -933,7 +1115,7 @@ static void StopSubscriptions(void)
     g_state.sub_count = 0;
 
     /* Close bookmarks */
-    for (int i = 0; i < CHANNEL_COUNT; i++) {
+    for (i = 0; i < (int)CHANNEL_COUNT; i++) {
         if (g_state.bookmarks[i].bookmark) {
             EvtClose(g_state.bookmarks[i].bookmark);
             g_state.bookmarks[i].bookmark = NULL;
@@ -942,13 +1124,204 @@ static void StopSubscriptions(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Status dialog                                                     */
+/*  Worker threads                                                    */
 /* ------------------------------------------------------------------ */
 
-/*
- * We build a simple status dialog programmatically instead of using
- * a resource file to keep everything in a single .c file.
- */
+static DWORD WINAPI EventWorkerThread(LPVOID param)
+{
+    UNREFERENCED_PARAMETER(param);
+
+    char hostname[256] = {0};
+    GetLocalHostname(hostname, sizeof(hostname));
+
+    /* Syslog line buffer: RFC 5424 header + JSON payload */
+    char* syslog_line = (char*)HeapAlloc(GetProcessHeap(), 0, MAX_SYSLOG_LINE);
+    if (!syslog_line) return 1;
+
+    DWORD last_flush = GetTickCount();
+
+    while (!g_state.shutdown) {
+
+        /* Reconnect if needed */
+        if (!g_state.syslog_connected) {
+            EnterCriticalSection(&g_state.syslog_lock);
+            if (!g_state.syslog_connected) {
+                if (!ConnectSyslog()) {
+                    LeaveCriticalSection(&g_state.syslog_lock);
+                    Sleep(RECONNECT_INTERVAL);
+                    continue;
+                }
+                ShowNotification(NIIF_INFO, APP_NAME,
+                    L"Syslog TCP connected — log shipping active");
+            }
+            LeaveCriticalSection(&g_state.syslog_lock);
+        }
+
+        /* Wait for events or flush timer */
+        WaitForSingleObject(g_state.queue_event,
+            (DWORD)(g_state.event_flush_interval * 1000));
+        if (g_state.shutdown) break;
+
+        /* Check flush conditions */
+        DWORD queue_count = 0;
+        EnterCriticalSection(&g_state.queue_lock);
+        queue_count = (DWORD)((g_state.event_queue_tail - g_state.event_queue_head
+                               + EVENT_QUEUE_SIZE) & EVENT_QUEUE_MASK);
+        LeaveCriticalSection(&g_state.queue_lock);
+
+        DWORD now = GetTickCount();
+        BOOL time_to_flush =
+            (queue_count >= (DWORD)g_state.event_flush_batch) ||
+            (queue_count > 0 && (now - last_flush >=
+             (DWORD)(g_state.event_flush_interval * 1000)));
+
+        if (!time_to_flush) continue;
+
+        /* Drain queue — send each entry as a syslog line */
+        BOOL send_ok = TRUE;
+        while (send_ok) {
+            char* json_obj = NULL;
+            size_t json_len = 0;
+
+            EnterCriticalSection(&g_state.queue_lock);
+            if (g_state.event_queue_head == g_state.event_queue_tail) {
+                /* Queue empty */
+                ResetEvent(g_state.queue_event);
+                LeaveCriticalSection(&g_state.queue_lock);
+                break;
+            }
+            json_obj = g_state.event_queue[g_state.event_queue_head];
+            json_len = g_state.event_queue_lens[g_state.event_queue_head];
+            g_state.event_queue[g_state.event_queue_head] = NULL;
+            g_state.event_queue_head =
+                (g_state.event_queue_head + 1) & EVENT_QUEUE_MASK;
+            LeaveCriticalSection(&g_state.queue_lock);
+
+            /* Wrap in RFC 5424 */
+            FormatLogSyslogLine(syslog_line, MAX_SYSLOG_LINE, hostname, json_obj);
+            HeapFree(GetProcessHeap(), 0, json_obj);
+
+            size_t line_len = strlen(syslog_line);
+
+            /* Thread-safe TCP send */
+            EnterCriticalSection(&g_state.syslog_lock);
+            send_ok = SyslogSendAll(syslog_line, line_len);
+            if (!send_ok) {
+                DisconnectSyslog();
+                ShowNotification(NIIF_WARNING, APP_NAME,
+                    L"Syslog TCP lost — reconnecting");
+            } else {
+                InterlockedIncrement64(&g_state.events_sent);
+            }
+            LeaveCriticalSection(&g_state.syslog_lock);
+        }
+
+        last_flush = GetTickCount();
+    }
+
+    /* Drain on shutdown */
+    EnterCriticalSection(&g_state.syslog_lock);
+    while (g_state.event_queue_head != g_state.event_queue_tail) {
+        char* json_obj = g_state.event_queue[g_state.event_queue_head];
+        size_t json_len = g_state.event_queue_lens[g_state.event_queue_head];
+        g_state.event_queue_head = (g_state.event_queue_head + 1) & EVENT_QUEUE_MASK;
+        if (json_obj && g_state.syslog_connected) {
+            FormatLogSyslogLine(syslog_line, MAX_SYSLOG_LINE, hostname, json_obj);
+            SyslogSendAll(syslog_line, strlen(syslog_line));
+        }
+        HeapFree(GetProcessHeap(), 0, json_obj);
+    }
+    LeaveCriticalSection(&g_state.syslog_lock);
+
+    DisconnectSyslog();
+    HeapFree(GetProcessHeap(), 0, syslog_line);
+    return 0;
+}
+
+static DWORD WINAPI MetricsThread(LPVOID param)
+{
+    UNREFERENCED_PARAMETER(param);
+
+    HTTP_CLIENT* client = HttpClientCreate(
+        g_state.backend_url, g_state.backend_token, g_state.tls_verify);
+    if (!client) return 1;
+
+    while (!g_state.shutdown) {
+        /* Sleep metrics_interval, waking every second to check shutdown */
+        int i;
+        for (i = 0; i < g_state.metrics_interval && !g_state.shutdown; i++)
+            Sleep(1000);
+        if (g_state.shutdown) break;
+
+        if (g_state.endpoint_id <= 0) continue; /* not registered yet */
+
+        MetricsPayload mp;
+        if (!CollectMetrics(&mp)) continue;
+
+        /* Build metrics JSON matching Python MetricPayload model */
+        char json_buf[1024];
+        JsonBuilder jb;
+        JsonInit(&jb, json_buf, sizeof(json_buf));
+        JsonObjectBegin(&jb);
+        JsonDouble(&jb, "cpu_usage",      mp.cpu_usage,      2);
+        JsonDouble(&jb, "memory_usage",   mp.memory_usage,   2);
+        JsonDouble(&jb, "disk_usage",     mp.disk_usage,     2);
+        JsonDouble(&jb, "uptime_seconds", mp.uptime_seconds, 2);
+        JsonInt   (&jb, "process_count",  mp.process_count);
+        JsonStr   (&jb, "metric_source",  "agent");
+        JsonStr   (&jb, "collected_at",   mp.collected_at);
+        JsonObjectEnd(&jb);
+        JsonFinish(&jb);
+
+        char path[64];
+        StringCchPrintfA(path, sizeof(path),
+            "/monitoring/endpoints/%d/metrics", g_state.endpoint_id);
+
+        int status = 0;
+        if (HttpPost(client, path, json_buf, NULL, 0, &status))
+            InterlockedIncrement64(&g_state.metrics_sent);
+    }
+
+    HttpClientDestroy(client);
+    return 0;
+}
+
+static DWORD WINAPI LogReaderThread(LPVOID param)
+{
+    UNREFERENCED_PARAMETER(param);
+
+    if (g_state.log_reader_cfg.count == 0) return 0;
+
+    /* Stack buffer for per-entry JSON */
+    char json_buf[MAX_EVENT_JSON];
+
+    while (!g_state.shutdown) {
+        /* Sleep log_interval, check shutdown every second */
+        for (int i = 0; i < g_state.log_interval && !g_state.shutdown; i++)
+            Sleep(1000);
+        if (g_state.shutdown) break;
+
+        LRLogBatch batch;
+        batch.count = 0;
+        if (!ReadNewLogs(&g_state.log_reader_cfg, g_state.endpoint_id, &batch))
+            continue;
+        if (batch.count == 0) continue;
+
+        /* Enqueue each entry into the shared ring buffer — EventWorkerThread
+           ships them over TCP syslog together with Windows events */
+        for (int i = 0; i < batch.count; i++) {
+            FormatLREntryJson(json_buf, sizeof(json_buf), &batch.entries[i]);
+            size_t len = strlen(json_buf);
+            if (len > 0) EnqueueLogJson(json_buf, len);
+        }
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Status dialog                                                     */
+/* ------------------------------------------------------------------ */
 
 #define IDC_STATUS_LABEL    3001
 #define IDC_STATUS_TEXT     3002
@@ -962,30 +1335,39 @@ static void UpdateStatusText(HWND hdlg)
     DWORD minutes = (uptime_s % 3600) / 60;
     DWORD seconds = uptime_s % 60;
 
-    const char* conn_status = g_state.connected ? "CONNECTED" : "DISCONNECTED";
+    const char* token_status = g_state.backend_token[0]
+        ? "Configured" : "NOT CONFIGURED";
+    const char* syslog_status = g_state.syslog_connected ? "CONNECTED" : "DISCONNECTED";
 
-    int offset = 0;
     StringCchPrintfA(text, sizeof(text),
-        "TechvSOC Event Forwarder\r\n\r\n"
-        "Status:\t\t%s\r\n"
+        "TechvSOC XDR Native Agent v%s\r\n\r\n"
+        "Backend URL:\t%s\r\n"
+        "Token:\t\t%s\r\n"
+        "Endpoint ID:\t%d\r\n"
+        "Syslog TCP:\t\t%s:%s (%s)\r\n\r\n"
         "Events Collected:\t%lld\r\n"
+        "Events Sent:\t%lld\r\n"
+        "Metrics Sent:\t%lld\r\n"
         "Uptime:\t\t%02lu:%02lu:%02lu\r\n"
-        "Syslog Target:\t%s:%s\r\n"
         "Channels Active:\t%d / %d\r\n\r\n"
         "Active Channels:\r\n",
-        conn_status,
+        g_state.agent_version,
+        g_state.backend_url,
+        token_status,
+        g_state.endpoint_id,
+        g_state.syslog_host, g_state.syslog_port, syslog_status,
         (long long)g_state.events_collected,
+        (long long)g_state.events_sent,
+        (long long)g_state.metrics_sent,
         hours, minutes, seconds,
-        g_state.syslog_host, g_state.syslog_port,
         g_state.sub_count, (int)CHANNEL_COUNT);
-    offset = (int)strlen(text);
 
-    for (int i = 0; i < (int)CHANNEL_COUNT && offset < (int)sizeof(text) - 260; i++) {
+    int offset = (int)strlen(text);
+    int i;
+    for (i = 0; i < (int)CHANNEL_COUNT && offset < (int)sizeof(text) - 260; i++) {
         if (g_state.channel_active[i]) {
-            const char* status_mark = "  [*] ";
             char entry[256];
-            StringCchPrintfA(entry, sizeof(entry), "%s%S (%S)\r\n",
-                status_mark,
+            StringCchPrintfA(entry, sizeof(entry), "  [*] %S (%S)\r\n",
                 g_channel_entries[i].name,
                 g_channel_entries[i].category ? g_channel_entries[i].category : L"General");
             StringCchCatA(text, sizeof(text), entry);
@@ -1037,11 +1419,6 @@ static void ShowStatusDialog(HINSTANCE inst)
         return;
     }
 
-    /* Build a dialog template in memory */
-    /*
-     * We use a minimal DLGTEMPLATEEX structure to create a dialog
-     * programmatically without a resource file.
-     */
     struct {
         DLGTEMPLATE dlg;
         WORD menu;
@@ -1052,8 +1429,8 @@ static void ShowStatusDialog(HINSTANCE inst)
     memset(&tmpl, 0, sizeof(tmpl));
     tmpl.dlg.style = WS_POPUP | WS_CAPTION | WS_SYSMENU |
                      DS_MODALFRAME | DS_CENTER;
-    tmpl.dlg.cx = 280;
-    tmpl.dlg.cy = 200;
+    tmpl.dlg.cx = 340;
+    tmpl.dlg.cy = 220;
     tmpl.dlg.x  = 0;
     tmpl.dlg.y  = 0;
     tmpl.menu   = 0;
@@ -1064,9 +1441,8 @@ static void ShowStatusDialog(HINSTANCE inst)
         inst, &tmpl.dlg, NULL, StatusDlgProc, 0);
 
     if (g_state.status_dialog) {
-        SetWindowTextW(g_state.status_dialog, L"TechvSOC Event Forwarder - Status");
+        SetWindowTextW(g_state.status_dialog, L"TechvSOC XDR Agent - Status");
 
-        /* Create a multiline edit control and a Close button */
         RECT rc;
         GetClientRect(g_state.status_dialog, &rc);
 
@@ -1083,7 +1459,6 @@ static void ShowStatusDialog(HINSTANCE inst)
             (HWND)g_state.status_dialog, (HMENU)(LONG_PTR)IDC_CLOSE_BTN,
             inst, NULL);
 
-        /* Use a monospace font */
         HFONT hfont = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE,
                                    FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                    CLIP_DEFAULT_PRECIS, FIXED_PITCH,
@@ -1239,10 +1614,10 @@ static BOOL CreateMessageWindow(HINSTANCE inst)
 static BOOL Initialize(HINSTANCE inst)
 {
     memset(&g_state, 0, sizeof(g_state));
-    g_state.sock = INVALID_SOCKET;
 
     InitializeCriticalSection(&g_state.queue_lock);
-    /* Fix: we need a manual-reset event for the queue */
+    InitializeCriticalSection(&g_state.syslog_lock);
+    g_state.syslog_sock = INVALID_SOCKET;
     g_state.queue_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!g_state.queue_event) {
         return FALSE;
@@ -1257,21 +1632,16 @@ static BOOL Initialize(HINSTANCE inst)
         return FALSE;
     }
 
-    /* Initialize Winsock */
     if (!InitializeWinsock()) {
-        ShowNotification(NIIF_ERROR, APP_NAME,
-            L"Fatal: Winsock initialization failed");
         return FALSE;
     }
 
     /* Register window class and create message window */
     if (!RegisterWindowClass(inst)) {
-        CleanupWinsock();
         return FALSE;
     }
 
     if (!CreateMessageWindow(inst)) {
-        CleanupWinsock();
         return FALSE;
     }
 
@@ -1293,15 +1663,40 @@ static BOOL Initialize(HINSTANCE inst)
         ShowNotification(NIIF_INFO, APP_NAME, msg);
     }
 
-    /* Start worker thread */
+    /* Register endpoint if not already registered */
+    if (g_state.endpoint_id <= 0 && g_state.backend_token[0]) {
+        HTTP_CLIENT* reg_client = HttpClientCreate(
+            g_state.backend_url, g_state.backend_token, g_state.tls_verify);
+        if (reg_client) {
+            int id = RegisterEndpoint(reg_client);
+            HttpClientDestroy(reg_client);
+            if (id > 0) {
+                g_state.endpoint_id = id;
+                SaveEndpointId(id);
+                WCHAR msg[256];
+                StringCchPrintfW(msg, 256, L"Registered as endpoint ID %d", id);
+                ShowNotification(NIIF_INFO, APP_NAME, msg);
+            }
+        }
+    }
+
+    /* Start event worker thread */
     g_state.shutdown = 0;
-    g_state.worker_thread = CreateThread(NULL, 0, WorkerThread, NULL,
-                                          0, NULL);
-    if (!g_state.worker_thread) {
+    g_state.event_worker_thread = CreateThread(NULL, 0, EventWorkerThread, NULL, 0, NULL);
+    if (!g_state.event_worker_thread) {
         StopSubscriptions();
         RemoveTrayIcon();
-        CleanupWinsock();
         return FALSE;
+    }
+
+    /* Start metrics thread (only if token configured) */
+    if (g_state.backend_token[0]) {
+        g_state.metrics_thread = CreateThread(NULL, 0, MetricsThread, NULL, 0, NULL);
+    }
+
+    /* Start log reader thread (only if log files configured and token present) */
+    if (g_state.log_reader_cfg.count > 0 && g_state.backend_token[0]) {
+        g_state.log_reader_thread = CreateThread(NULL, 0, LogReaderThread, NULL, 0, NULL);
     }
 
     return TRUE;
@@ -1309,55 +1704,47 @@ static BOOL Initialize(HINSTANCE inst)
 
 static void Cleanup(void)
 {
-    /* Signal shutdown */
+    /* Signal shutdown and wake worker */
     InterlockedExchange(&g_state.shutdown, 1);
-
-    /* Wake up the worker thread */
     SetEvent(g_state.queue_event);
 
-    /* Wait for worker thread to finish */
-    if (g_state.worker_thread) {
-        WaitForSingleObject(g_state.worker_thread, 5000);
-        CloseHandle(g_state.worker_thread);
-        g_state.worker_thread = NULL;
-    }
+    /* Wait for all threads */
+    HANDLE threads[3];
+    int t_count = 0;
+    if (g_state.event_worker_thread) threads[t_count++] = g_state.event_worker_thread;
+    if (g_state.metrics_thread)      threads[t_count++] = g_state.metrics_thread;
+    if (g_state.log_reader_thread)   threads[t_count++] = g_state.log_reader_thread;
+    if (t_count) WaitForMultipleObjects(t_count, threads, TRUE, 10000);
 
-    /* Save bookmarks */
-    SaveBookmarks();
+    /* Close handles */
+    if (g_state.event_worker_thread) { CloseHandle(g_state.event_worker_thread); g_state.event_worker_thread = NULL; }
+    if (g_state.metrics_thread)      { CloseHandle(g_state.metrics_thread);      g_state.metrics_thread      = NULL; }
+    if (g_state.log_reader_thread)   { CloseHandle(g_state.log_reader_thread);   g_state.log_reader_thread   = NULL; }
 
-    /* Stop subscriptions */
+    /* Save bookmarks and stop subscriptions */
     StopSubscriptions();
-
-    /* Disconnect syslog */
-    DisconnectSyslog();
 
     /* Remove tray icon */
     RemoveTrayIcon();
 
-    /* Clean up queue */
-    for (;;) {
-        EVENT_NODE* node = DequeueEvent();
-        if (!node) break;
-        FreeEventNode(node);
+    /* Drain event queue */
+    EnterCriticalSection(&g_state.queue_lock);
+    while (g_state.event_queue_head != g_state.event_queue_tail) {
+        HeapFree(GetProcessHeap(), 0, g_state.event_queue[g_state.event_queue_head]);
+        g_state.event_queue_head = (g_state.event_queue_head + 1) & EVENT_QUEUE_MASK;
     }
-
-    /* Clean up critical section */
+    LeaveCriticalSection(&g_state.queue_lock);
     DeleteCriticalSection(&g_state.queue_lock);
-
-    /* Close queue event */
-    if (g_state.queue_event) {
-        CloseHandle(g_state.queue_event);
-        g_state.queue_event = NULL;
-    }
+    DisconnectSyslog();
+    DeleteCriticalSection(&g_state.syslog_lock);
+    CleanupWinsock();
+    if (g_state.queue_event) { CloseHandle(g_state.queue_event); g_state.queue_event = NULL; }
 
     /* Destroy menu */
     if (g_state.tray_menu) {
         DestroyMenu(g_state.tray_menu);
         g_state.tray_menu = NULL;
     }
-
-    /* Cleanup Winsock */
-    CleanupWinsock();
 
     /* Destroy message window */
     if (g_state.msg_window) {
