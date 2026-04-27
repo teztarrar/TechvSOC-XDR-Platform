@@ -21,6 +21,9 @@ class Settings(BaseSettings):
         alias="DATABASE_URL",
     )
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
+    syslog_tcp_enabled: bool = Field(default=True,      alias="SYSLOG_TCP_ENABLED")
+    syslog_tcp_host:    str  = Field(default="0.0.0.0", alias="SYSLOG_TCP_HOST")
+    syslog_tcp_port:    int  = Field(default=5514,      alias="SYSLOG_TCP_PORT")
     secret_key: str = Field(default="change-this-in-production", alias="SECRET_KEY")
     access_token_expire_minutes: int = Field(
         default=60,
